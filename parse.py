@@ -3,9 +3,11 @@ import email.parser
 import email.utils
 import dateutil.parser
 import sys
+import uuid
+import json
+import re
 
-
-class emailName(str):
+class email_name(str):
     """
     An object initialized with a string that should be
     an e-mail address: performs operations to parse out
@@ -50,36 +52,155 @@ class emailName(str):
         except IndexError:
             pass
         return elements
+
+# Create just once for speed.
+parser = email.parser.Parser()
+
+class email_message(object):
+    def __init__(self,string,id=None):
+        """
+        Initializes with an e-mail string and, optionally, a parser.
+        (Operations will be faster if you don't create the parser anew each time.
+        """
+        global parser
+        self.string = string
+        try:
+            self.parsed = parser.parsestr(string)
+        except UnicodeEncodeError:
+            raise
             
-def writeMessage(string,yearlims = [1970,2020]):
-    global id
-    global parser
-    global catalog
-    global input
-    parsed = parser.parsestr(string)
-    metadata = dict(parsed)
+        # Creating a uuid a little early.
+        # THIS ALWAYS FAILS. EVERY UUID IS THE SAME. WHY????
 
-    metadata['searchstring'] = string.replace("\n","<br>")
-    # Clean the metadata and make some elements into arrays.
-    try: metadata["Path"] = metadata["Path"].split("!")
-    except: pass
-    try: metadata["Newsgroups"] = metadata["Newsgroups"].split(",")
-    except: pass
-    if "From" in metadata:
-        email = emailName(metadata["From"])
-        emailFields = email.elements()
-        for key in emailFields.keys():
-            metadata[key] = emailFields[key]
-    try: 
-        metadata["date"] = dateutil.parser.parse(metadata["Date"]).isoformat()
-        year = metadata["date"][:4]
-        if int(year) < yearlims[0] or int(year) > yearlims[1]:
-            year = ""
-    except: 
-        pass
+        if id is None:
+            self.uuid = uuid.uuid1()
+            self.uuid = self.uuid.hex
+        else:
+            self.uuid=id
 
-    id += 1
-    metadata["filename"] = str(id)
+    def metadata(self,additional_keys = dict(),yearlims=[1970,2020]):
+        """
+        Return metadata as a dictionary for the object.
 
-    catalog.write(json.dumps(metadata) + "\n")
-    input.write(str(id) + "\t" + parsed.get_payload().replace("\n"," ").replace("\t"," ") + "\n")
+        Optionally initialized with a dict of elements to be included,
+        including the unique id as 'filename'.
+        
+        "yearlims" is an array of bounding years. Any years outside this 
+        indicate a date-parsing error, and are dropped.
+        """
+        metadata = dict(self.parsed)
+
+        # Get the ID and other fields from additional_keys
+        if 'filename' not in additional_keys:
+            additional_keys['filename'] = self.uuid
+
+        for key,value in additional_keys.items():
+            metadata[key] = value
+
+        metadata['searchstring'] = self.string.replace("\n","<br>").replace("\t","     ")
+
+        if "From" in metadata:
+            email = email_name(metadata["From"])
+            emailFields = email.elements()
+            for key in emailFields.keys():
+                metadata["sender_" + key] = emailFields[key]
+
+        try: 
+            metadata["date"] = dateutil.parser.parse(metadata["Date"]).isoformat()
+            year = metadata["date"][:4]
+            if int(year) < yearlims[0] or int(year) > yearlims[1]:
+                year = ""
+        except:
+            pass
+
+        return metadata
+
+
+    def write_to_files(self,catalog,input):
+        """
+        Writes the email out to the specified jsoncatalog.txt and input.txt files,
+        which should be writable filehandles.
+
+        Returns true.
+        """
+
+
+
+        metadata = self.metadata({'filename':self.uuid})
+        catalog.write(json.dumps(metadata) + "\n")
+        text = self.parsed.get_payload().replace("\n","\\n\\n").replace("\t"," ")
+        input.write(metadata['filename'] + "\t" + text.encode("utf-8","ignore") + "\n")
+
+
+def blocks_of_text(file):
+    """
+    Breaks a text into white-space separated blocks.
+    Some will be kept, some dropped.
+    """
+    text = ""
+    for line in file:
+        line = line.replace("\r","\n").replace("\n\n","\n")
+        if line=="\n":
+            if text != "\n":
+                #Don't just return a previously blank line
+                yield text
+            text = ""
+        else:
+            text += line
+    yield text
+
+
+def archive_to_emails(filename):
+    """
+    Initialized with a filename: yields a succession of email objects, hopefully.
+    """
+    lastBlank = True
+    text = ""
+
+    file = open(filename)
+
+
+    def yield_up(text):
+        """
+        A little wrapper to handle IDs and error handling.
+        """
+        try:
+            return email_message(text,uuid.uuid1().hex)
+        except UnicodeError:
+            pass
+                    
+    for block in blocks_of_text(file):
+        block= block.decode("utf-8","ignore")
+
+        skipOn = False
+        # Just skip the whole block for these regexes        
+        for regex in [r"^From humanist-bounces" # Humanist headers
+                      , r"                  Humanist Discussion Group, Vol."
+                      , r"^  \[[0-9]+\]  From:    " # A table of contents format
+                  ]:
+            if re.search(regex,block):
+                # Continuing from inside a for-loop breaks the wrong level.
+                skipOn = True
+        
+        if skipOn:
+            continue
+                
+        #Signals start of a block
+        if block.startswith("From: "):
+            yield yield_up(text)
+            text = block
+            
+        # Humanist Format
+        elif re.search(r"^(--\[[0-9]+\]------------+\n)?        Date:",block):
+            yield yield_up(text)
+            lines = block.split("\n")
+            lines = [re.sub("^ +","",line) for line in lines if re.search("^ +",line)]
+            text = "\n".join(lines) + "\n"
+
+        # else just keep on going
+        # Add in one extra newline
+        else:
+            text = text + "\n" + block
+
+    # Yield one last time at the end.
+    yield yield_up(text)
